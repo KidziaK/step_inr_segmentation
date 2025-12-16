@@ -26,17 +26,7 @@ class ColorPalette(str, Enum):
 
 def scale_mesh_to_box(vertices: np.ndarray) -> np.ndarray:
     V = vertices - vertices.mean(axis=0)
-    
-    vals, vecs = np.linalg.eigh(np.cov(V.T))
-    idx = np.argsort(vals)[::-1]
-    vecs = vecs[:, idx]
-    
-    if np.linalg.det(vecs) < 0:
-        vecs[:, -1] *= -1
-    
-    V = V @ vecs
     V = 0.5 * V / np.max(np.abs(V))
-    
     return V
 
 
