@@ -178,3 +178,5 @@ tensorboard/
 *.pb
 
 /data
+
+.cursorrules
