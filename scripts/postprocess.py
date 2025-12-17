@@ -13,6 +13,12 @@ try:
 except ImportError:
     HAS_TRIMESH = False
 
+try:
+    from scipy.optimize import linear_sum_assignment
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 
 class ColorPalette(str, Enum):
     TAB20 = "tab20"
@@ -28,6 +34,124 @@ def scale_mesh_to_box(vertices: np.ndarray) -> np.ndarray:
     V = vertices - vertices.mean(axis=0)
     V = 0.5 * V / np.max(np.abs(V))
     return V
+
+
+def sample_mesh_surface(vertices: np.ndarray, faces: np.ndarray, num_samples: int = 10000) -> np.ndarray:
+    if not HAS_TRIMESH:
+        raise ImportError("trimesh is required for surface sampling")
+    
+    tm = trimesh.Trimesh(vertices=vertices, faces=faces)
+    samples, _ = tm.sample(num_samples)
+    return samples
+
+
+def find_nearest_triangles(query_points: np.ndarray, vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    if not HAS_TRIMESH:
+        raise ImportError("trimesh is required for nearest triangle queries")
+    
+    tm = trimesh.Trimesh(vertices=vertices, faces=faces)
+    closest, distances, triangle_ids = tm.nearest.on_surface(query_points)
+    return triangle_ids
+
+
+def vote_class_correspondence(
+    mesh1_vertices: np.ndarray,
+    mesh1_faces: np.ndarray,
+    mesh1_classes: np.ndarray,
+    mesh2_vertices: np.ndarray,
+    mesh2_faces: np.ndarray,
+    mesh2_classes: np.ndarray,
+    num_samples: int = 10000
+) -> np.ndarray:
+    samples = sample_mesh_surface(mesh1_vertices, mesh1_faces, num_samples)
+    mesh1_triangle_ids = find_nearest_triangles(samples, mesh1_vertices, mesh1_faces)
+    mesh2_triangle_ids = find_nearest_triangles(samples, mesh2_vertices, mesh2_faces)
+    
+    mesh1_sample_classes = mesh1_classes[mesh1_triangle_ids]
+    mesh2_sample_classes = mesh2_classes[mesh2_triangle_ids]
+    
+    max_class1 = np.max(mesh1_classes) + 1
+    max_class2 = np.max(mesh2_classes) + 1
+    
+    correspondence_matrix = np.zeros((max_class1, max_class2), dtype=int)
+    
+    for c1, c2 in zip(mesh1_sample_classes, mesh2_sample_classes):
+        correspondence_matrix[c1, c2] += 1
+    
+    return correspondence_matrix
+
+
+def solve_assignment(correspondence_matrix: np.ndarray) -> np.ndarray:
+    if not HAS_SCIPY:
+        raise ImportError("scipy is required for assignment problem")
+    
+    row_ind, col_ind = linear_sum_assignment(-correspondence_matrix)
+    
+    max_class = max(correspondence_matrix.shape[0], correspondence_matrix.shape[1])
+    permutation = np.arange(max_class)
+    
+    for i, j in zip(row_ind, col_ind):
+        if i < max_class and j < max_class:
+            permutation[i] = j
+    
+    return permutation
+
+
+def unify_class_ids_three_meshes(
+    mesh1_vertices: np.ndarray,
+    mesh1_faces: np.ndarray,
+    mesh1_classes: np.ndarray,
+    mesh2_vertices: np.ndarray,
+    mesh2_faces: np.ndarray,
+    mesh2_classes: np.ndarray,
+    mesh3_vertices: np.ndarray,
+    mesh3_faces: np.ndarray,
+    mesh3_classes: np.ndarray,
+    num_samples: int = 10000
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    correspondence_12 = vote_class_correspondence(
+        mesh1_vertices, mesh1_faces, mesh1_classes,
+        mesh2_vertices, mesh2_faces, mesh2_classes,
+        num_samples
+    )
+    permutation_12 = solve_assignment(correspondence_12)
+    
+    max_class2 = np.max(mesh2_classes) + 1
+    if len(permutation_12) < max_class2:
+        extended_perm = np.arange(max_class2)
+        for i in range(min(len(permutation_12), max_class2)):
+            extended_perm[i] = permutation_12[i] if i < len(permutation_12) else i
+        permutation_12 = extended_perm
+    
+    mesh2_classes_aligned = np.zeros_like(mesh2_classes)
+    for i in range(len(mesh2_classes)):
+        if mesh2_classes[i] < len(permutation_12):
+            mesh2_classes_aligned[i] = permutation_12[mesh2_classes[i]]
+        else:
+            mesh2_classes_aligned[i] = mesh2_classes[i]
+    
+    correspondence_23 = vote_class_correspondence(
+        mesh2_vertices, mesh2_faces, mesh2_classes_aligned,
+        mesh3_vertices, mesh3_faces, mesh3_classes,
+        num_samples
+    )
+    permutation_23 = solve_assignment(correspondence_23)
+    
+    max_class3 = np.max(mesh3_classes) + 1
+    if len(permutation_23) < max_class3:
+        extended_perm = np.arange(max_class3)
+        for i in range(min(len(permutation_23), max_class3)):
+            extended_perm[i] = permutation_23[i] if i < len(permutation_23) else i
+        permutation_23 = extended_perm
+    
+    mesh3_classes_aligned = np.zeros_like(mesh3_classes)
+    for i in range(len(mesh3_classes)):
+        if mesh3_classes[i] < len(permutation_23):
+            mesh3_classes_aligned[i] = permutation_23[mesh3_classes[i]]
+        else:
+            mesh3_classes_aligned[i] = mesh3_classes[i]
+    
+    return mesh1_classes, mesh2_classes_aligned, mesh3_classes_aligned
 
 
 def extract_part_ids_from_mesh(mesh: meshio.Mesh) -> np.ndarray:
@@ -116,7 +240,72 @@ def process_npz_file(npz_path: Path, out_path: Path, palette: ColorPalette) -> N
     mesh.write(out_path, binary=True)
 
 
-def process_ply_file(ply_path: Path, out_path: Path, palette: ColorPalette) -> None:
+def load_mesh_data(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if HAS_TRIMESH:
+        try:
+            tm = trimesh.load(str(ply_path))
+            if not isinstance(tm, trimesh.Trimesh):
+                raise ValueError(f"File {ply_path} does not contain a triangle mesh")
+            vertices = tm.vertices
+            faces = tm.faces
+            
+            cell_data = {}
+            face_colors = None
+            
+            if hasattr(tm, 'metadata') and tm.metadata and '_ply_raw' in tm.metadata:
+                ply_data = tm.metadata['_ply_raw']
+                if 'face' in ply_data and 'data' in ply_data['face']:
+                    face_data = ply_data['face']['data']
+                    if face_data.dtype.names and 'red' in face_data.dtype.names and 'green' in face_data.dtype.names and 'blue' in face_data.dtype.names:
+                        alpha = face_data['alpha'] if 'alpha' in face_data.dtype.names else np.full(len(face_data), 255)
+                        face_colors = np.column_stack([
+                            face_data['red'],
+                            face_data['green'],
+                            face_data['blue'],
+                            alpha
+                        ])
+            
+            if hasattr(tm, 'face_attributes') and tm.face_attributes:
+                for key, value in tm.face_attributes.items():
+                    cell_data[key] = [value]
+            
+            if face_colors is not None:
+                unique_colors, color_indices = np.unique(face_colors, axis=0, return_inverse=True)
+                cell_data['face_color_part_id'] = [color_indices]
+            
+            mesh = meshio.Mesh(
+                vertices,
+                [("triangle", faces)],
+                cell_data=cell_data
+            )
+        except Exception as e:
+            try:
+                mesh = meshio.read(ply_path)
+            except Exception:
+                raise ValueError(f"Failed to read PLY file {ply_path}: {e}")
+    else:
+        mesh = meshio.read(ply_path)
+    
+    triangle_cells = [c for c in mesh.cells if c.type == "triangle"]
+    if not triangle_cells:
+        raise ValueError(f"No triangle cells found in {ply_path}")
+    
+    faces = triangle_cells[0].data
+    vertices = mesh.points
+    part = extract_part_ids_from_mesh(mesh)
+    
+    if len(part) != len(faces):
+        if len(part) == 1:
+            part = np.repeat(part, len(faces))
+        elif len(part) > 0:
+            part = np.tile(part, (len(faces) // len(part) + 1))[:len(faces)]
+        else:
+            part = np.zeros(len(faces), dtype=int)
+    
+    return vertices, faces, part
+
+
+def process_ply_file(ply_path: Path, out_path: Path, palette: ColorPalette, unified_classes: np.ndarray = None) -> None:
     if HAS_TRIMESH:
         try:
             tm = trimesh.load(str(ply_path))
@@ -197,15 +386,18 @@ def process_ply_file(ply_path: Path, out_path: Path, palette: ColorPalette) -> N
     
     V_scaled = scale_mesh_to_box(vertices)
     
-    part = extract_part_ids_from_mesh(mesh)
-    
-    if len(part) != len(faces):
-        if len(part) == 1:
-            part = np.repeat(part, len(faces))
-        elif len(part) > 0:
-            part = np.tile(part, (len(faces) // len(part) + 1))[:len(faces)]
-        else:
-            part = np.zeros(len(faces), dtype=int)
+    if unified_classes is not None:
+        part = unified_classes
+    else:
+        part = extract_part_ids_from_mesh(mesh)
+        
+        if len(part) != len(faces):
+            if len(part) == 1:
+                part = np.repeat(part, len(faces))
+            elif len(part) > 0:
+                part = np.tile(part, (len(faces) // len(part) + 1))[:len(faces)]
+            else:
+                part = np.zeros(len(faces), dtype=int)
     
     uniq, inverse = np.unique(part, return_inverse=True)
     cmap = plt.get_cmap(palette.value)
@@ -234,11 +426,11 @@ def process_ply_file(ply_path: Path, out_path: Path, palette: ColorPalette) -> N
     output_mesh.write(out_path, binary=True)
 
 
-def process_file(input_path: Path, output_path: Path, palette: ColorPalette) -> None:
+def process_file(input_path: Path, output_path: Path, palette: ColorPalette, unified_classes: np.ndarray = None) -> None:
     if input_path.suffix == ".npz":
         process_npz_file(input_path, output_path, palette)
     elif input_path.suffix == ".ply":
-        process_ply_file(input_path, output_path, palette)
+        process_ply_file(input_path, output_path, palette, unified_classes)
     else:
         raise ValueError(f"Unsupported file format: {input_path.suffix}")
 
@@ -290,17 +482,73 @@ def main():
         
         print(f"Processing {folder_name}...")
         
+        resolution_folders = ["coarser_meshes240", "default_meshes240", "finer_meshes240"]
+        if folder_name == "partfield":
+            resolution_folders = ["coarser_partfield240", "default_partfield240", "finer_partfield240"]
+        
+        file_groups = {}
+        
         for ext in args.extensions:
             for input_file in sorted(input_folder.rglob(f"*{ext}")):
-                rel_path = input_file.relative_to(input_folder)
-                output_file = output_folder / rel_path.with_suffix(".ply")
+                filename = input_file.name
+                base_name = filename.replace("_labels.ply", "").replace(".ply", "").replace(".npz", "")
                 
+                if base_name not in file_groups:
+                    file_groups[base_name] = {}
+                
+                for res_folder in resolution_folders:
+                    if res_folder in str(input_file):
+                        file_groups[base_name][res_folder] = input_file
+                        break
+        
+        for base_name, group_files in file_groups.items():
+            if len(group_files) == 3:
                 try:
-                    process_file(input_file, output_file, palette)
-                    print(f"  Processed: {rel_path}")
+                    mesh_files = []
+                    for res_folder in resolution_folders:
+                        if res_folder in group_files:
+                            mesh_files.append(group_files[res_folder])
+                    
+                    if len(mesh_files) == 3:
+                        print(f"  Unifying class IDs for {base_name}...")
+                        
+                        mesh1_path, mesh2_path, mesh3_path = mesh_files
+                        
+                        mesh1_vertices, mesh1_faces, mesh1_classes = load_mesh_data(mesh1_path)
+                        mesh2_vertices, mesh2_faces, mesh2_classes = load_mesh_data(mesh2_path)
+                        mesh3_vertices, mesh3_faces, mesh3_classes = load_mesh_data(mesh3_path)
+                        
+                        unified_1, unified_2, unified_3 = unify_class_ids_three_meshes(
+                            mesh1_vertices, mesh1_faces, mesh1_classes,
+                            mesh2_vertices, mesh2_faces, mesh2_classes,
+                            mesh3_vertices, mesh3_faces, mesh3_classes
+                        )
+                        
+                        for i, (mesh_path, unified_classes) in enumerate(zip(mesh_files, [unified_1, unified_2, unified_3])):
+                            rel_path = mesh_path.relative_to(input_folder)
+                            output_file = output_folder / rel_path.with_suffix(".ply")
+                            process_file(mesh_path, output_file, palette, unified_classes)
+                        
+                        print(f"  Processed group: {base_name}")
                 except Exception as e:
-                    print(f"  Error processing {rel_path}: {e}")
-                    continue
+                    print(f"  Error processing group {base_name}: {e}")
+                    for mesh_path in mesh_files:
+                        try:
+                            rel_path = mesh_path.relative_to(input_folder)
+                            output_file = output_folder / rel_path.with_suffix(".ply")
+                            process_file(mesh_path, output_file, palette)
+                            print(f"  Processed (without unification): {rel_path}")
+                        except Exception as e2:
+                            print(f"  Error processing {rel_path}: {e2}")
+            else:
+                for res_folder, mesh_path in group_files.items():
+                    try:
+                        rel_path = mesh_path.relative_to(input_folder)
+                        output_file = output_folder / rel_path.with_suffix(".ply")
+                        process_file(mesh_path, output_file, palette)
+                        print(f"  Processed (single mesh): {rel_path}")
+                    except Exception as e:
+                        print(f"  Error processing {rel_path}: {e}")
     
     print("Postprocessing complete!")
 

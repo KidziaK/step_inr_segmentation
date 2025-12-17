@@ -180,3 +180,5 @@ tensorboard/
 /data
 
 .cursorrules
+
+*.csv

@@ -9,4 +9,5 @@ dependencies = [
     "meshio",
     "matplotlib",
     "trimesh",
+    "scipy",
 ]
