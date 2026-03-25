@@ -10,4 +10,6 @@ dependencies = [
     "matplotlib",
     "trimesh",
     "scipy",
+    "fire>=0.7.1",
+    "pillow>=12.0.0",
 ]

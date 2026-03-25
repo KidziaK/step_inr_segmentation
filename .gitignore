@@ -183,3 +183,7 @@ tensorboard/
 
 *.csv
 *.blend1
+
+/meshes
+/outputs
+/figures
